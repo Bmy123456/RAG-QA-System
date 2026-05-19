@@ -3,5 +3,5 @@ __pycache__/
 .env
 data/
 node_modules/
-dist/
+/dist/
 .vite/
