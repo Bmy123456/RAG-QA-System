@@ -71,6 +71,11 @@ class QueryLog(Base):
     retrieval_strategy = Column(String(20), nullable=True)  # dense/sparse/hybrid
     retrieval_count = Column(Integer, default=0)         # 初始召回文档数
     reranked_count = Column(Integer, default=0)          # 重排序后文档数
+    retrieval_ms = Column(Integer, default=0)            # 检索阶段耗时（毫秒）
+    rerank_ms = Column(Integer, default=0)               # 重排序阶段耗时（毫秒）
+    generation_ms = Column(Integer, default=0)           # LLM 生成阶段耗时（毫秒）
+    retrieved_chunk_ids = Column(Text, nullable=True)    # 初始召回 chunk_id JSON 数组
+    reranked_chunk_ids = Column(Text, nullable=True)     # 重排序后 chunk_id JSON 数组
     created_at = Column(DateTime, default=datetime.utcnow)
 
     def to_dict(self) -> dict:
@@ -91,5 +96,10 @@ class QueryLog(Base):
             "retrieval_strategy": self.retrieval_strategy,
             "retrieval_count": self.retrieval_count,
             "reranked_count": self.reranked_count,
+            "retrieval_ms": self.retrieval_ms,
+            "rerank_ms": self.rerank_ms,
+            "generation_ms": self.generation_ms,
+            "retrieved_chunk_ids": self.retrieved_chunk_ids,
+            "reranked_chunk_ids": self.reranked_chunk_ids,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

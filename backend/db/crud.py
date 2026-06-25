@@ -4,6 +4,8 @@ CRUD 操作：知识库和文档的增删改查。
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy.orm import Session
 
 from backend.models.document import KnowledgeBase, Document
@@ -401,3 +403,278 @@ def get_query_log_stats(db: Session) -> dict:
         "avg_tokens": round(avg_tokens, 1),
         "avg_retrieval_count": round(avg_retrieval, 1),
     }
+
+
+def get_recall_evaluation_data(
+    db: Session,
+    kb_id: int | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """导出召回评估数据：每条记录包含 query、retrieved_ids、reranked_ids、sources。
+
+    返回格式适用于 backend.evaluation.evaluate_retrieval 的离线评估：
+    [
+        {
+            "query": "...",
+            "retrieved_doc_ids": ["chunk_id_1", ...],   # 初始召回
+            "reranked_doc_ids": ["chunk_id_2", ...],     # 重排序后
+            "sources_json": "...",                        # 最终引用
+            "kb_id": 1,
+            "session_id": "...",
+            "created_at": "..."
+        }
+    ]
+    """
+    q = db.query(QueryLog).filter(QueryLog.retrieved_chunk_ids.isnot(None))
+    if kb_id is not None:
+        q = q.filter(QueryLog.kb_id == kb_id)
+    logs = q.order_by(QueryLog.created_at.desc()).limit(limit).all()
+
+    result = []
+    for log in logs:
+        result.append({
+            "query": log.question,
+            "retrieved_doc_ids": json.loads(log.retrieved_chunk_ids) if log.retrieved_chunk_ids else [],
+            "reranked_doc_ids": json.loads(log.reranked_chunk_ids) if log.reranked_chunk_ids else [],
+            "sources_json": log.sources_json,
+            "kb_id": log.kb_id,
+            "session_id": log.session_id,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        })
+    return result
+
+
+# ===========================================================================
+# 仪表盘统计函数
+# ===========================================================================
+
+def get_dashboard_overview(db: Session) -> dict:
+    """仪表盘概览：今日问答量、延迟、满意度。"""
+    from sqlalchemy import func
+    from datetime import timedelta
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # 今日问答量
+    today_count = db.query(QueryLog).filter(QueryLog.created_at >= today_start).count()
+
+    # 延迟统计（今日）
+    today_logs = db.query(QueryLog).filter(QueryLog.created_at >= today_start).all()
+    if today_logs:
+        latencies = sorted(l.latency_ms for l in today_logs)
+        avg_latency = round(sum(latencies) / len(latencies), 1)
+        p95_latency = round(_percentile(latencies, 95), 1)
+    else:
+        avg_latency = 0
+        p95_latency = 0
+
+    # 满意度（最近 7 天）
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    useful = db.query(Feedback).filter(
+        Feedback.feedback_type == "useful", Feedback.created_at >= week_ago
+    ).count()
+    useless = db.query(Feedback).filter(
+        Feedback.feedback_type == "useless", Feedback.created_at >= week_ago
+    ).count()
+    satisfaction = round(useful / max(1, useful + useless), 4)
+
+    return {
+        "today_query_count": today_count,
+        "avg_latency_ms": avg_latency,
+        "p95_latency_ms": p95_latency,
+        "satisfaction_rate": satisfaction,
+    }
+
+
+def get_latency_breakdown(db: Session, hours: int = 24) -> dict:
+    """分阶段延迟统计（avg / P95）。"""
+    from sqlalchemy import func
+
+    since = datetime.utcnow() - timedelta(hours=hours)
+    logs = db.query(QueryLog).filter(QueryLog.created_at >= since).all()
+
+    if not logs:
+        return {
+            "retrieval": {"avg_ms": 0, "p95_ms": 0},
+            "rerank": {"avg_ms": 0, "p95_ms": 0},
+            "generation": {"avg_ms": 0, "p95_ms": 0},
+        }
+
+    def _stats(values):
+        if not values:
+            return {"avg_ms": 0, "p95_ms": 0}
+        s = sorted(values)
+        return {
+            "avg_ms": round(sum(s) / len(s), 1),
+            "p95_ms": round(_percentile(s, 95), 1),
+        }
+
+    return {
+        "retrieval": _stats([l.retrieval_ms for l in logs if l.retrieval_ms]),
+        "rerank": _stats([l.rerank_ms for l in logs if l.rerank_ms]),
+        "generation": _stats([l.generation_ms for l in logs if l.generation_ms]),
+    }
+
+
+def get_hourly_feedback_trend(db: Session, hours: int = 24) -> list[dict]:
+    """按小时的点赞/点踩趋势。"""
+    from sqlalchemy import func
+
+    since = datetime.utcnow() - timedelta(hours=hours)
+    rows = (
+        db.query(
+            func.strftime("%Y-%m-%d %H:00", Feedback.created_at).label("hour"),
+            Feedback.feedback_type,
+            func.count().label("count"),
+        )
+        .filter(Feedback.created_at >= since)
+        .group_by("hour", Feedback.feedback_type)
+        .order_by("hour")
+        .all()
+    )
+
+    # 构建时间轴
+    result = []
+    for h in range(hours, 0, -1):
+        t = datetime.utcnow() - timedelta(hours=h)
+        hour_str = t.strftime("%Y-%m-%d %H:00")
+        useful = next((r.count for r in rows if r.hour == hour_str and r.feedback_type == "useful"), 0)
+        useless = next((r.count for r in rows if r.hour == hour_str and r.feedback_type == "useless"), 0)
+        result.append({"hour": hour_str, "useful": useful, "useless": useless})
+
+    return result
+
+
+def get_top_disliked_docs(db: Session, limit: int = 5) -> list[dict]:
+    """高频点踩文档 Top N。"""
+    from sqlalchemy import func
+    import json
+
+    rows = (
+        db.query(Feedback.kb_id, func.count().label("count"))
+        .filter(Feedback.feedback_type == "useless")
+        .filter(Feedback.kb_id.isnot(None))
+        .group_by(Feedback.kb_id)
+        .order_by(func.count().desc())
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for r in rows:
+        kb = db.query(KnowledgeBase).filter(KnowledgeBase.id == r.kb_id).first()
+        result.append({
+            "kb_id": r.kb_id,
+            "kb_name": kb.name if kb else "未知",
+            "dislike_count": r.count,
+        })
+    return result
+
+
+def get_token_usage_by_model(db: Session, hours: int = 24) -> list[dict]:
+    """按模型的 Token 消耗统计。"""
+    from sqlalchemy import func
+
+    since = datetime.utcnow() - timedelta(hours=hours)
+    rows = (
+        db.query(
+            QueryLog.model,
+            func.count().label("call_count"),
+            func.sum(QueryLog.token_total).label("total_tokens"),
+            func.sum(QueryLog.token_prompt).label("prompt_tokens"),
+            func.sum(QueryLog.token_completion).label("completion_tokens"),
+        )
+        .filter(QueryLog.created_at >= since)
+        .filter(QueryLog.model.isnot(None))
+        .group_by(QueryLog.model)
+        .order_by(func.sum(QueryLog.token_total).desc())
+        .all()
+    )
+
+    return [
+        {
+            "model": r.model,
+            "call_count": r.call_count,
+            "total_tokens": r.total_tokens or 0,
+            "prompt_tokens": r.prompt_tokens or 0,
+            "completion_tokens": r.completion_tokens or 0,
+        }
+        for r in rows
+    ]
+
+
+def get_dashboard_alerts(db: Session) -> list[dict]:
+    """基于阈值规则生成告警。"""
+    from datetime import timedelta
+
+    alerts = []
+    now = datetime.utcnow()
+    hour_ago = now - timedelta(hours=1)
+    day_ago = now - timedelta(days=1)
+
+    # 规则 1：5xx 错误率 > 1%
+    recent_logs = db.query(QueryLog).filter(QueryLog.created_at >= hour_ago).all()
+    if recent_logs:
+        # 通过检查 answer 是否包含错误标记来估算（query_logs 不直接记录 HTTP 状态码）
+        pass
+
+    # 规则 2：平均延迟 > 10s
+    day_logs = db.query(QueryLog).filter(QueryLog.created_at >= day_ago).all()
+    if day_logs:
+        avg_lat = sum(l.latency_ms for l in day_logs) / len(day_logs)
+        if avg_lat > 10000:
+            alerts.append({
+                "level": "warning",
+                "message": f"过去 24h 平均延迟 {avg_lat:.0f}ms，超过 10s 阈值",
+                "timestamp": now.isoformat(),
+            })
+
+    # 规则 3：点踩率突增
+    day_useful = db.query(Feedback).filter(
+        Feedback.feedback_type == "useful", Feedback.created_at >= day_ago
+    ).count()
+    day_useless = db.query(Feedback).filter(
+        Feedback.feedback_type == "useless", Feedback.created_at >= day_ago
+    ).count()
+    if day_useful + day_useless > 5:
+        dislike_rate = day_useless / (day_useful + day_useless)
+        if dislike_rate > 0.3:
+            alerts.append({
+                "level": "warning",
+                "message": f"过去 24h 点踩率 {dislike_rate:.0%}，超过 30% 阈值",
+                "timestamp": now.isoformat(),
+            })
+
+    # 规则 4：待处理反馈积压
+    pending = db.query(Feedback).filter(Feedback.status == "pending").count()
+    if pending > 20:
+        alerts.append({
+            "level": "info",
+            "message": f"当前有 {pending} 条反馈待处理",
+            "timestamp": now.isoformat(),
+        })
+
+    # 规则 5：召回为空（retrieval_count == 0）
+    empty_count = db.query(QueryLog).filter(
+        QueryLog.created_at >= day_ago, QueryLog.retrieval_count == 0
+    ).count()
+    if day_logs and empty_count / len(day_logs) > 0.1:
+        alerts.append({
+            "level": "warning",
+            "message": f"过去 24h {empty_count} 次查询召回为空（{empty_count/len(day_logs):.0%}），请检查知识库覆盖",
+            "timestamp": now.isoformat(),
+        })
+
+    return alerts
+
+
+def _percentile(sorted_data: list, p: int) -> float:
+    """计算百分位数（输入必须已排序）。"""
+    if not sorted_data:
+        return 0.0
+    k = (len(sorted_data) - 1) * p / 100
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_data):
+        return float(sorted_data[-1])
+    return float(sorted_data[f]) + (k - f) * float(sorted_data[c] - sorted_data[f])

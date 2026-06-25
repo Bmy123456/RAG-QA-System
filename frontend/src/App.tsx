@@ -8,6 +8,7 @@ import KnowledgeBasePage from './pages/KnowledgeBase'
 import FeedbackPage from './pages/Feedback'
 import EvaluationPage from './pages/Evaluation'
 import VectorMonitorPage from './pages/VectorMonitor'
+import DashboardPage from './pages/Dashboard'
 import { useAuthStore } from './stores/authStore'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -43,6 +44,7 @@ export default function App() {
               <Route path="/kb" element={<KnowledgeBasePage />} />
               <Route path="/feedback" element={<FeedbackPage />} />
               <Route path="/evaluation" element={<EvaluationPage />} />
+              <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/vectors" element={<VectorMonitorPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/chat" replace />} />
