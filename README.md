@@ -17,7 +17,7 @@
 
 ### 1. 环境准备
 
-- Python 3.11+
+- Python 3.10+
 - Node.js 18+（前端构建）
 - LLM API Key（MiMo / DeepSeek / OpenAI 等）
 
