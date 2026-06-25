@@ -20,6 +20,7 @@ from backend.db.crud import (
     update_feedback_status, get_feedback_trend, get_feedback_distribution,
     get_pending_feedback_count, get_feedback_export,
     create_query_log, list_query_logs, get_query_log_stats,
+    get_recall_evaluation_data,
 )
 from backend.db.session import get_db
 from backend.api.auth import require_user, require_admin
@@ -174,6 +175,21 @@ def run_retrieval_evaluation(db: Session = Depends(get_db)):
     from backend.evaluation.evaluate_retrieval import evaluate_retrieval
     results = evaluate_retrieval(test_data, db)
     return results
+
+
+@router.get("/recall-data")
+def get_recall_data(
+    kb_id: int | None = None,
+    limit: int = Query(500, ge=1, le=5000),
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """导出召回评估数据（管理员）。
+
+    返回每次查询的初始召回 chunk_id 列表和重排序后 chunk_id 列表，
+    可配合标注的 relevant_doc_ids 离线计算 Recall@K、Precision@K 等指标。
+    """
+    return get_recall_evaluation_data(db, kb_id=kb_id, limit=limit)
 
 
 @router.get("/generation")

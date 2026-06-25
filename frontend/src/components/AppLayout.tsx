@@ -6,6 +6,7 @@ import {
   DatabaseOutlined,
   BarChartOutlined,
   FormOutlined,
+  DashboardOutlined,
   EyeOutlined,
   LogoutOutlined,
   UserOutlined,
@@ -32,7 +33,10 @@ export default function AppLayout() {
     { key: '/feedback', icon: <FormOutlined />, label: isAdmin ? '反馈管理' : '我的反馈' },
     { key: '/evaluation', icon: <BarChartOutlined />, label: '评估' },
     ...(isAdmin
-      ? [{ key: '/vectors', icon: <EyeOutlined />, label: '向量监控' }]
+      ? [
+          { key: '/dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
+          { key: '/vectors', icon: <EyeOutlined />, label: '向量监控' },
+        ]
       : []),
   ]
 

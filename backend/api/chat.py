@@ -196,14 +196,17 @@ async def chat(
     from backend.core.vector_store import SearchFilter
     search_filter = SearchFilter(kb_id=data.kb_id) if data.kb_id else None
 
+    retrieval_start = time.time()
     retrieval_results = await retriever.retrieve(
         query=search_query,
         search_filter=search_filter,
         top_k=RETRIEVAL_CONFIG["initial_top_k"],
         strategy=data.strategy,
     )
+    retrieval_ms = int((time.time() - retrieval_start) * 1000)
 
     # 重排序
+    rerank_start = time.time()
     if retrieval_results:
         reranker = _get_reranker()
         from backend.core.reranker import RerankInput
@@ -212,6 +215,7 @@ async def chat(
         rerank_results = await reranker.rerank(search_query, rerank_inputs, top_k=final_top_k)
     else:
         rerank_results = []
+    rerank_ms = int((time.time() - rerank_start) * 1000)
 
     # 获取截断后的历史
     history = await conv_mgr.get_truncated_history(session_id)
@@ -219,7 +223,7 @@ async def chat(
 
     # 生成回答
     generator = _get_generator()
-    start_time = time.time()
+    generation_start = time.time()
 
     if data.stream:
         return StreamingResponse(
@@ -236,7 +240,12 @@ async def chat(
                 strategy=data.strategy,
                 retrieval_count=len(retrieval_results),
                 reranked_count=len(rerank_results),
+                retrieval_ms=retrieval_ms,
+                rerank_ms=rerank_ms,
+                generation_start=generation_start,
                 db=db,
+                retrieved_ids=[r.chunk_id for r in retrieval_results],
+                reranked_ids=[r.chunk_id for r in rerank_results],
             ),
             media_type="text/event-stream",
             headers={
@@ -257,7 +266,8 @@ async def chat(
             metadata={"sources": [asdict(s) for s in result.sources]},
         )
 
-        latency_ms = int((time.time() - start_time) * 1000)
+        generation_ms = int((time.time() - generation_start) * 1000)
+        latency_ms = retrieval_ms + rerank_ms + generation_ms
         if QA_LOGGING_ENABLED:
             logger = get_query_logger()
             logger.log(db, {
@@ -276,6 +286,11 @@ async def chat(
                 "retrieval_strategy": data.strategy,
                 "retrieval_count": len(retrieval_results),
                 "reranked_count": len(rerank_results),
+                "retrieval_ms": retrieval_ms,
+                "rerank_ms": rerank_ms,
+                "generation_ms": generation_ms,
+                "retrieved_chunk_ids": json.dumps([r.chunk_id for r in retrieval_results], ensure_ascii=False),
+                "reranked_chunk_ids": json.dumps([r.chunk_id for r in rerank_results], ensure_ascii=False),
             })
 
         return ChatResponse(
@@ -306,14 +321,18 @@ async def _stream_response(
     strategy: str,
     retrieval_count: int,
     reranked_count: int,
+    retrieval_ms: int,
+    rerank_ms: int,
+    generation_start: float,
     db: Session,
+    retrieved_ids: list[str] | None = None,
+    reranked_ids: list[str] | None = None,
 ):
     """SSE 流式输出生成器。"""
     from backend.db.session import SessionLocal
 
     full_answer = ""
     sources_data = []
-    start_time = time.time()
 
     try:
         async for chunk in generator.generate_stream(question, documents, history):
@@ -340,7 +359,8 @@ async def _stream_response(
     )
 
     # 记录查询日志（使用独立 session，避免请求级 session 已关闭的问题）
-    latency_ms = int((time.time() - start_time) * 1000)
+    generation_ms = int((time.time() - generation_start) * 1000)
+    latency_ms = retrieval_ms + rerank_ms + generation_ms
     if QA_LOGGING_ENABLED:
         log_db = SessionLocal()
         try:
@@ -361,6 +381,11 @@ async def _stream_response(
                 "retrieval_strategy": strategy,
                 "retrieval_count": retrieval_count,
                 "reranked_count": reranked_count,
+                "retrieval_ms": retrieval_ms,
+                "rerank_ms": rerank_ms,
+                "generation_ms": generation_ms,
+                "retrieved_chunk_ids": json.dumps(retrieved_ids or [], ensure_ascii=False),
+                "reranked_chunk_ids": json.dumps(reranked_ids or [], ensure_ascii=False),
             })
         finally:
             log_db.close()

@@ -18,6 +18,8 @@ from backend.api.chat import router as chat_router
 from backend.api.evaluation import router as eval_router
 from backend.api.auth import router as auth_router
 from backend.api.admin import router as admin_router
+from backend.api.dashboard import router as dashboard_router
+from backend.middleware.metrics import MetricsMiddleware
 import backend.models  # noqa: F401  # 确保所有 ORM 表注册
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -46,12 +48,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# HTTP 请求指标中间件
+app.add_middleware(MetricsMiddleware)
+
 # 注册路由
 app.include_router(auth_router)
 app.include_router(kb_router)
 app.include_router(chat_router)
 app.include_router(eval_router)
 app.include_router(admin_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/api/health")
