@@ -1,0 +1,1285 @@
+"""
+Streamlit 前端：简洁 RAG 智能问答界面。
+
+功能：
+- 登录/注册页面
+- 侧边栏：选择/创建/删除知识库、上传文档、查看处理进度
+- 主聊天区：流式逐字显示回答、引用卡片、反馈按钮
+- 会话管理：新建/切换/清空会话
+- 所有 API 请求自动携带 JWT Token
+
+启动：
+    streamlit run frontend/app.py --server.port 8501
+"""
+
+import json
+import time
+from datetime import datetime, timedelta
+
+import requests
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+API_BASE = "http://localhost:8000"
+
+
+# ---------------------------------------------------------------------------
+# API 工具函数（自动携带 Token）
+# ---------------------------------------------------------------------------
+
+
+def _headers() -> dict:
+    """构建带 Token 的请求头。"""
+    token = st.session_state.get("access_token")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def api_get(path: str, params: dict | None = None):
+    try:
+        resp = requests.get(f"{API_BASE}{path}", params=params, headers=_headers(), timeout=30)
+        if resp.status_code == 401:
+            st.session_state["access_token"] = None
+            st.rerun()
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"请求失败: {e}")
+        return None
+
+
+def api_post(path: str, data: dict | None = None, files: dict | None = None):
+    try:
+        if files:
+            resp = requests.post(f"{API_BASE}{path}", files=files, data=data, headers=_headers(), timeout=120)
+        else:
+            resp = requests.post(f"{API_BASE}{path}", json=data, headers=_headers(), timeout=60)
+        if resp.status_code == 401:
+            st.session_state["access_token"] = None
+            st.rerun()
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"请求失败: {e}")
+        return None
+
+
+def api_put(path: str, data: dict | None = None):
+    try:
+        resp = requests.put(f"{API_BASE}{path}", json=data, headers=_headers(), timeout=30)
+        if resp.status_code == 401:
+            st.session_state["access_token"] = None
+            st.rerun()
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"请求失败: {e}")
+        return None
+
+
+def api_delete(path: str):
+    try:
+        resp = requests.delete(f"{API_BASE}{path}", headers=_headers(), timeout=10)
+        if resp.status_code == 401:
+            st.session_state["access_token"] = None
+            st.rerun()
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"请求失败: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 会话状态初始化
+# ---------------------------------------------------------------------------
+
+
+def init_state():
+    defaults = {
+        "access_token": None,
+        "refresh_token": None,
+        "username": None,
+        "user_role": None,
+        "messages": [],
+        "session_id": None,
+        "kb_id": None,
+        "kb_name": "",
+        "current_page": "chat",  # chat / evaluation
+        "streaming": False,  # 是否正在流式输出
+        "streaming_question": "",  # 正在流式输出的问题
+        "streaming_answer": "",  # 已积累的回答
+        "streaming_sources": [],  # 已获取的来源
+        "streaming_done": False,  # 流式是否已完成
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
+
+
+# ---------------------------------------------------------------------------
+# 登录/注册页面
+# ---------------------------------------------------------------------------
+
+
+def auth_page():
+    """登录/注册页面。"""
+    st.title("🤖 RAG 智能问答系统")
+    st.markdown("---")
+
+    tab_login, tab_register = st.tabs(["登录", "注册"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("用户名", key="login_user")
+            password = st.text_input("密码", type="password", key="login_pass")
+            submitted = st.form_submit_button("登录", use_container_width=True)
+            if submitted:
+                if not username or not password:
+                    st.error("请输入用户名和密码")
+                else:
+                    result = api_post("/api/auth/login", {"username": username, "password": password})
+                    if result:
+                        st.session_state["access_token"] = result["access_token"]
+                        st.session_state["refresh_token"] = result["refresh_token"]
+                        st.session_state["username"] = username
+                        # 获取用户信息
+                        me = api_get("/api/auth/me")
+                        if me:
+                            st.session_state["user_role"] = me.get("role", "user")
+                        st.rerun()
+
+    with tab_register:
+        with st.form("register_form"):
+            reg_user = st.text_input("用户名", key="reg_user")
+            reg_email = st.text_input("邮箱（可选）", key="reg_email")
+            reg_pass = st.text_input("密码（≥8位，含大小写+数字）", type="password", key="reg_pass")
+            reg_pass2 = st.text_input("确认密码", type="password", key="reg_pass2")
+            reg_submit = st.form_submit_button("注册", use_container_width=True)
+            if reg_submit:
+                if not reg_user or not reg_pass:
+                    st.error("请输入用户名和密码")
+                elif reg_pass != reg_pass2:
+                    st.error("两次密码不一致")
+                else:
+                    payload = {"username": reg_user, "password": reg_pass}
+                    if reg_email:
+                        payload["email"] = reg_email
+                    result = api_post("/api/auth/register", payload)
+                    if result:
+                        st.session_state["access_token"] = result["access_token"]
+                        st.session_state["refresh_token"] = result["refresh_token"]
+                        st.session_state["username"] = reg_user
+                        st.session_state["user_role"] = "user"
+                        st.success("注册成功！")
+                        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：用户信息
+# ---------------------------------------------------------------------------
+
+
+def sidebar_user():
+    """侧边栏顶部显示用户信息、页面切换和登出按钮。"""
+    st.sidebar.markdown(f"**👤 {st.session_state.get('username', '未知')}**")
+    st.sidebar.caption(f"角色: {st.session_state.get('user_role', 'user')}")
+
+    # 页面切换（流式输出时禁止切换，避免中断）
+    is_streaming = st.session_state.get("streaming", False)
+    is_admin = st.session_state.get("user_role") == "admin"
+    if is_admin:
+        page_options = ["💬 对话", "📋 反馈管理", "📊 评估", "🔍 向量监控"]
+    else:
+        page_options = ["💬 对话", "📋 我的反馈", "📊 评估"]
+    page = st.sidebar.radio(
+        "页面", page_options,
+        horizontal=True, key="page_selector",
+        disabled=is_streaming,
+    )
+    if is_streaming:
+        st.sidebar.caption("⏳ 回答生成中，请勿切换页面…")
+    if "评估" in page:
+        st.session_state["current_page"] = "evaluation"
+    elif "反馈管理" in page:
+        st.session_state["current_page"] = "admin_feedback"
+    elif "我的反馈" in page:
+        st.session_state["current_page"] = "my_feedback"
+    elif "向量监控" in page:
+        st.session_state["current_page"] = "vector_monitor"
+    else:
+        st.session_state["current_page"] = "chat"
+
+    if st.sidebar.button("🚪 退出登录", use_container_width=True):
+        for key in ["access_token", "refresh_token", "username", "user_role",
+                     "messages", "session_id", "kb_id", "kb_name"]:
+            st.session_state[key] = None if key != "messages" else []
+        st.rerun()
+
+    st.sidebar.markdown("---")
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：知识库管理
+# ---------------------------------------------------------------------------
+
+
+def sidebar_knowledge_base():
+    st.sidebar.title("📚 知识库管理")
+
+    kbs = api_get("/api/kb")
+    if kbs is None:
+        kbs = []
+
+    kb_options = {f"{kb['name']} (ID:{kb['id']}, {kb['doc_count']}篇)": kb["id"] for kb in kbs}
+
+    if kb_options:
+        selected = st.sidebar.selectbox(
+            "选择知识库",
+            options=list(kb_options.keys()),
+            index=0 if st.session_state.kb_id is None else (
+                list(kb_options.values()).index(st.session_state.kb_id)
+                if st.session_state.kb_id in kb_options.values() else 0
+            ),
+        )
+        st.session_state.kb_id = kb_options[selected]
+        st.session_state.kb_name = selected.split(" (")[0]
+    else:
+        st.sidebar.info("暂无知识库，请创建。")
+        st.session_state.kb_id = None
+        st.session_state.kb_name = ""
+
+    # 创建
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("➕ 创建知识库"):
+        new_name = st.text_input("知识库名称", key="new_kb_name")
+        new_desc = st.text_input("描述（可选）", key="new_kb_desc")
+        new_public = st.checkbox("设为公共知识库", key="new_kb_public")
+        if st.button("创建", key="create_kb_btn"):
+            if new_name.strip():
+                result = api_post("/api/kb", {
+                    "name": new_name.strip(),
+                    "description": new_desc.strip(),
+                    "is_public": new_public,
+                })
+                if result:
+                    st.success(f"知识库 '{new_name}' 创建成功！")
+                    st.rerun()
+            else:
+                st.warning("请输入名称。")
+
+    # 删除
+    if st.session_state.kb_id:
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🗑️ 删除当前知识库", type="secondary"):
+            result = api_delete(f"/api/kb/{st.session_state.kb_id}")
+            if result:
+                st.session_state.kb_id = None
+                st.session_state.kb_name = ""
+                st.session_state.session_id = None
+                st.session_state.messages = []
+                st.success("已删除。")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：文档管理
+# ---------------------------------------------------------------------------
+
+
+def _batch_delete_docs():
+    """回调：批量删除选中文档。"""
+    selected = st.session_state.get("doc_select", [])
+    if not selected:
+        return
+    kb_id = st.session_state.kb_id
+    doc_ids = [int(s.split("|", 1)[0]) for s in selected]
+    api_post(f"/api/kb/{kb_id}/documents/batch/delete", data={"doc_ids": doc_ids})
+
+
+def _batch_retry_docs():
+    """回调：批量重传选中文档。"""
+    selected = st.session_state.get("doc_select", [])
+    if not selected:
+        return
+    kb_id = st.session_state.kb_id
+    doc_ids = [int(s.split("|", 1)[0]) for s in selected]
+    api_post(f"/api/kb/{kb_id}/documents/batch/retry", data={"doc_ids": doc_ids})
+
+
+def sidebar_documents():
+    if not st.session_state.kb_id:
+        return
+
+    docs = api_get(f"/api/kb/{st.session_state.kb_id}/documents")
+    has_processing = any(d["status"] == "processing" for d in docs) if docs else False
+
+    if has_processing:
+        st_autorefresh(interval=3000, key="doc_progress_poll")
+
+    st.sidebar.markdown("---")
+    st.sidebar.title("📄 文档管理")
+
+    # --- 上传区 ---
+    uploaded_files = st.sidebar.file_uploader(
+        "上传文档",
+        type=["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "txt", "md", "html", "htm", "png", "jpg", "jpeg", "bmp", "eml", "msg"],
+        accept_multiple_files=True,
+        key="file_uploader",
+    )
+    if uploaded_files and st.sidebar.button("开始上传", key="upload_btn"):
+        for f in uploaded_files:
+            files = {"file": (f.name, f.getvalue(), f.type or "application/octet-stream")}
+            result = api_post(f"/api/kb/{st.session_state.kb_id}/upload", files=files)
+            if result:
+                st.sidebar.success(f"✅ {f.name}")
+            else:
+                st.sidebar.error(f"❌ {f.name} 上传失败")
+
+    st.sidebar.markdown("---")
+
+    if not docs:
+        st.sidebar.info("暂无文档。")
+        return
+
+    # --- 统计摘要 ---
+    total = len(docs)
+    completed = sum(1 for d in docs if d["status"] == "completed")
+    processing = sum(1 for d in docs if d["status"] == "processing")
+    failed = sum(1 for d in docs if d["status"] == "failed")
+
+    status_icon = {"completed": "✅", "processing": "⏳", "failed": "❌", "pending": "⏸️"}
+
+    stat_parts = [f"共 **{total}** 个"]
+    if completed:
+        stat_parts.append(f"✅{completed}")
+    if processing:
+        stat_parts.append(f"⏳{processing}")
+    if failed:
+        stat_parts.append(f"❌{failed}")
+    st.sidebar.caption("  |  ".join(stat_parts))
+
+    # --- 处理中文档进度 ---
+    processing_docs = [d for d in docs if d["status"] == "processing"]
+    if processing_docs:
+        for doc in processing_docs:
+            progress = doc.get("progress", 0)
+            progress_msg = doc.get("progress_msg", "")
+            st.sidebar.markdown(f"⏳ **{doc['filename']}**")
+            st.sidebar.progress(progress / 100.0)
+            st.sidebar.caption(f"{progress}% — {progress_msg}" if progress_msg else f"{progress}%")
+
+    # --- 文档选择下拉框 ---
+    selectable = [d for d in docs if d["status"] != "processing"]
+    if selectable:
+        options = [
+            f"{d['id']}|{status_icon.get(d['status'], '❓')} {d['filename']}"
+            for d in selectable
+        ]
+        label_map = {opt: opt.split("|", 1)[1] for opt in options}
+
+        st.sidebar.multiselect(
+            "选择文档",
+            options=options,
+            format_func=lambda x: label_map.get(x, x),
+            key="doc_select",
+            placeholder="点击选择文档…",
+        )
+
+        selected = st.session_state.get("doc_select", [])
+        if selected:
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                st.button(
+                    f"🗑️ 删除 ({len(selected)})",
+                    key="btn_batch_del",
+                    use_container_width=True,
+                    on_click=_batch_delete_docs,
+                )
+            with col2:
+                st.button(
+                    f"🔄 重传 ({len(selected)})",
+                    key="btn_batch_retry",
+                    use_container_width=True,
+                    on_click=_batch_retry_docs,
+                )
+
+    # --- 失败文档提示 ---
+    if failed:
+        failed_names = [d["filename"] for d in docs if d["status"] == "failed"]
+        with st.sidebar.expander(f"❌ 失败文档 ({failed})", expanded=False):
+            for name in failed_names:
+                st.caption(name)
+
+
+# ---------------------------------------------------------------------------
+# 侧边栏：会话管理
+# ---------------------------------------------------------------------------
+
+
+def sidebar_sessions():
+    st.sidebar.markdown("---")
+    st.sidebar.title("💬 会话管理")
+
+    if st.sidebar.button("➕ 新建会话", key="new_session"):
+        st.session_state.session_id = None
+        st.session_state.messages = []
+        st.rerun()
+
+    params = {}
+    if st.session_state.kb_id:
+        params["kb_id"] = st.session_state.kb_id
+    sessions = api_get("/api/chat/sessions", params=params)
+
+    if sessions:
+        for s in sessions:
+            sid = s["session_id"]
+            title = s.get("title", "新会话")
+            msg_count = s.get("message_count", 0)
+            is_current = sid == st.session_state.session_id
+
+            col1, col2 = st.sidebar.columns([4, 1])
+            with col1:
+                prefix = "📌 " if is_current else "💬 "
+                label = f"{prefix}{title}"
+                if st.button(label, key=f"sess_{sid}", help=f"{msg_count}条消息"):
+                    history = api_get(f"/api/chat/history/{sid}")
+                    if history:
+                        st.session_state.session_id = sid
+                        st.session_state.messages = []
+                        for msg in history.get("messages", []):
+                            st.session_state.messages.append({
+                                "role": msg["role"],
+                                "content": msg["content"],
+                                "sources": msg.get("metadata", {}).get("sources", []),
+                            })
+                        st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"del_sess_{sid}"):
+                    api_delete(f"/api/chat/history/{sid}")
+                    if sid == st.session_state.session_id:
+                        st.session_state.session_id = None
+                        st.session_state.messages = []
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 主聊天区：流式发送
+# ---------------------------------------------------------------------------
+
+
+def stream_chat(question: str, kb_id: int | None, session_id: str | None):
+    payload = {
+        "question": question,
+        "kb_id": kb_id,
+        "session_id": session_id,
+        "stream": True,
+        "strategy": "hybrid",
+    }
+
+    full_answer = ""
+    sources = []
+    new_session_id = session_id
+    rewritten_query = None
+
+    try:
+        with requests.post(
+            f"{API_BASE}/api/chat",
+            json=payload,
+            stream=True,
+            timeout=120,
+            headers={**_headers(), "Accept": "text/event-stream"},
+        ) as resp:
+            if resp.status_code == 401:
+                st.session_state["access_token"] = None
+                st.rerun()
+            resp.raise_for_status()
+
+            if "x-session-id" in resp.headers:
+                new_session_id = resp.headers["x-session-id"]
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data = line[6:]
+                else:
+                    continue
+
+                if data == "[DONE]":
+                    break
+
+                if data.startswith("[SOURCES]"):
+                    raw = data[len("[SOURCES]"):]
+                    try:
+                        sources = json.loads(raw)
+                    except json.JSONDecodeError:
+                        sources = []
+                    continue
+
+                full_answer += data
+                yield full_answer, sources, new_session_id, rewritten_query, False
+
+    except Exception as e:
+        full_answer += f"\n\n⚠️ 流式读取出错: {e}"
+
+    yield full_answer, sources, new_session_id, rewritten_query, True
+
+
+# ---------------------------------------------------------------------------
+# 反馈组件
+# ---------------------------------------------------------------------------
+
+
+def _get_question_for_msg(idx: int) -> str:
+    """获取第 idx 条助手消息对应的用户问题。"""
+    messages = st.session_state.get("messages", [])
+    # 向前找最近的用户消息
+    for j in range(idx - 1, -1, -1):
+        if messages[j]["role"] == "user":
+            return messages[j]["content"]
+    return ""
+
+
+def _render_feedback_buttons(idx: int, msg: dict):
+    """为助手消息渲染反馈按钮（有用/无用/纠正）。"""
+    fb_key = f"fb_done_{idx}"       # 已提交的反馈类型
+    expand_key = f"fb_expand_{idx}"  # 当前展开的输入框类型
+    done_type = st.session_state.get(fb_key)
+
+    if done_type:
+        # 已反馈，显示状态
+        label_map = {"useful": "✅ 已标记有用", "useless": "✅ 已标记无用", "correction": "✅ 已提交纠正"}
+        st.caption(label_map.get(done_type, "✅ 已反馈"))
+        return
+
+    # 获取当前展开类型
+    expand_type = st.session_state.get(expand_key)
+
+    # 三个按钮
+    col1, col2, col3, _ = st.columns([1.2, 1.2, 1.5, 5])
+    with col1:
+        if st.button("👍 有用", key=f"fb_useful_{idx}"):
+            _submit_feedback(idx, "useful")
+            st.session_state[fb_key] = "useful"
+            st.toast("感谢反馈！")
+            st.rerun()
+    with col2:
+        if st.button("👎 无用", key=f"fb_useless_{idx}"):
+            st.session_state[expand_key] = "useless" if expand_type != "useless" else None
+            st.rerun()
+    with col3:
+        if st.button("✏️ 我要纠正", key=f"fb_correct_{idx}"):
+            st.session_state[expand_key] = "correction" if expand_type != "correction" else None
+            st.rerun()
+
+    # 展开输入区域
+    if expand_type == "useless":
+        reason = st.text_area(
+            "请说明原因或指出错误：",
+            key=f"fb_reason_{idx}",
+            height=80,
+            placeholder="例如：回答与文档内容不符、信息过时、逻辑错误…",
+        )
+        if st.button("提交", key=f"fb_submit_useless_{idx}"):
+            if reason.strip():
+                _submit_feedback(idx, "useless", reason=reason.strip())
+                st.session_state[fb_key] = "useless"
+                st.session_state[expand_key] = None
+                st.toast("感谢反馈，我们会改进！")
+                st.rerun()
+            else:
+                st.warning("请填写原因")
+
+    elif expand_type == "correction":
+        correction = st.text_area(
+            "请输入正确答案：",
+            key=f"fb_correction_{idx}",
+            height=100,
+            placeholder="请输入您认为正确的回答…",
+        )
+        if st.button("提交纠正", key=f"fb_submit_correction_{idx}"):
+            if correction.strip():
+                _submit_feedback(idx, "correction", correction=correction.strip())
+                st.session_state[fb_key] = "correction"
+                st.session_state[expand_key] = None
+                st.toast("感谢纠正，我们会审阅并更新！")
+                st.rerun()
+            else:
+                st.warning("请输入正确答案")
+
+
+def _submit_feedback(idx: int, feedback_type: str, reason: str = "", correction: str = ""):
+    """调用反馈提交接口。"""
+    msg = st.session_state.messages[idx] if idx < len(st.session_state.messages) else {}
+    question = _get_question_for_msg(idx)
+    api_post("/api/evaluation/feedback", {
+        "session_id": st.session_state.session_id or "",
+        "message_index": idx,
+        "feedback_type": feedback_type,
+        "reason": reason,
+        "correction": correction,
+        "question": question[:500],
+        "answer": msg.get("content", "")[:500],
+    })
+
+
+# ---------------------------------------------------------------------------
+# 主聊天区
+# ---------------------------------------------------------------------------
+
+
+def main_chat():
+    st.title("🤖 RAG 智能问答")
+    if st.session_state.kb_name:
+        st.caption(f"当前知识库: **{st.session_state.kb_name}** | 会话: `{st.session_state.session_id or '新建'}`")
+    else:
+        st.caption("未选择知识库（将跨库检索）")
+
+    # 预加载当前会话的反馈状态（避免刷新后重复提交）
+    sid = st.session_state.session_id
+    fb_cache_key = f"fb_cache_{sid}"
+    if sid and not st.session_state.get(fb_cache_key):
+        result = api_get("/api/evaluation/feedback", params={"session_id": sid, "limit": 200})
+        if result and result.get("items"):
+            for fb in result["items"]:
+                idx = fb.get("message_index", 0)
+                st.session_state[f"fb_done_{idx}"] = fb["feedback_type"]
+        st.session_state[fb_cache_key] = True
+
+    # 如果上次流式输出被中断（切换页面），保存未完成的回答
+    if st.session_state.get("streaming") and st.session_state.get("streaming_answer"):
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": st.session_state["streaming_answer"] + "\n\n⚠️ *（回答被页面切换中断）*",
+            "sources": st.session_state.get("streaming_sources", []),
+        })
+        st.session_state["streaming"] = False
+        st.session_state["streaming_answer"] = ""
+        st.session_state["streaming_sources"] = []
+        st.session_state["streaming_question"] = ""
+
+    # 渲染历史消息
+    for i, msg in enumerate(st.session_state.messages):
+        role = msg["role"]
+        content = msg["content"]
+        sources = msg.get("sources", [])
+
+        with st.chat_message(role):
+            st.markdown(content)
+            if sources:
+                with st.expander(f"📎 引用来源 ({len(sources)}篇)", expanded=False):
+                    for src in sources:
+                        page = src.get('page')
+                        page_str = f" · 第{page}页" if page else ""
+                        st.markdown(
+                            f"**[{src.get('index', '?')}]** "
+                            f"`{src.get('filename', '未知')}`"
+                            f"{page_str}"
+                        )
+                        snippet = src.get("snippet", "")
+                        if snippet:
+                            st.markdown(f"> {snippet[:300]}{'...' if len(snippet) > 300 else ''}")
+                        st.markdown("---")
+
+            # 助手消息：反馈按钮
+            if role == "assistant":
+                _render_feedback_buttons(i, msg)
+
+    # 用户输入
+    if question := st.chat_input("输入你的问题..."):
+        st.session_state.messages.append({"role": "user", "content": question, "sources": []})
+        # 标记流式状态
+        st.session_state["streaming"] = True
+        st.session_state["streaming_question"] = question
+        st.session_state["streaming_answer"] = ""
+        st.session_state["streaming_sources"] = []
+        st.rerun()
+
+    # 流式输出中：执行请求并逐步显示
+    if st.session_state.get("streaming"):
+        question = st.session_state["streaming_question"]
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            sources_final = []
+            answer = ""
+
+            for answer, sources, new_sid, rewritten_query, done in stream_chat(
+                question, st.session_state.kb_id, st.session_state.session_id,
+            ):
+                # 保存中间状态（页面切换时不丢失）
+                st.session_state["streaming_answer"] = answer
+                st.session_state["streaming_sources"] = sources
+                placeholder.markdown(answer + "▌" if not done else answer)
+                sources_final = sources
+                if new_sid:
+                    st.session_state.session_id = new_sid
+
+            if rewritten_query:
+                st.caption(f"🔍 改写后的查询: {rewritten_query}")
+
+            if sources_final:
+                with st.expander(f"📎 引用来源 ({len(sources_final)}篇)", expanded=False):
+                    for src in sources_final:
+                        page = src.get('page')
+                        page_str = f" · 第{page}页" if page else ""
+                        st.markdown(
+                            f"**[{src.get('index', '?')}]** "
+                            f"`{src.get('filename', '未知')}`"
+                            f"{page_str}"
+                        )
+                        snippet = src.get("snippet", "")
+                        if snippet:
+                            st.markdown(f"> {snippet[:300]}{'...' if len(snippet) > 300 else ''}")
+                        st.markdown("---")
+
+        # 流式完成，保存到消息列表
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources_final,
+        })
+        st.session_state["streaming"] = False
+        st.session_state["streaming_answer"] = ""
+        st.session_state["streaming_sources"] = []
+        st.session_state["streaming_question"] = ""
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 我的反馈页面
+# ---------------------------------------------------------------------------
+
+
+def my_feedback_page():
+    """普通用户查看自己的反馈历史。"""
+    st.title("📋 我的反馈")
+
+    # 筛选栏
+    col1, col2 = st.columns(2)
+    with col1:
+        fb_type = st.selectbox(
+            "反馈类型",
+            ["全部", "有用", "无用", "纠正"],
+            key="fb_filter_type",
+        )
+    with col2:
+        fb_status = st.selectbox(
+            "处理状态",
+            ["全部", "待处理", "已审阅", "已采纳", "已关闭"],
+            key="fb_filter_status",
+        )
+
+    # 映射中文→英文
+    type_map = {"全部": None, "有用": "useful", "无用": "useless", "纠正": "correction"}
+    status_map = {"全部": None, "待处理": "pending", "已审阅": "reviewed", "已采纳": "adopted", "已关闭": "closed"}
+
+    params = {"limit": 50}
+    if type_map[fb_type]:
+        params["feedback_type"] = type_map[fb_type]
+    if status_map[fb_status]:
+        params["status"] = status_map[fb_status]
+
+    result = api_get("/api/evaluation/feedback", params=params)
+
+    if not result or not result.get("items"):
+        st.info("📭 暂无反馈记录。在对话中对助手回答提交反馈后，将在此显示。")
+        return
+
+    items = result["items"]
+    total = result.get("total", len(items))
+    st.caption(f"共 {total} 条反馈")
+
+    # 状态样式
+    status_badge = {
+        "pending": "🟡 待处理",
+        "reviewed": "🔵 已审阅",
+        "adopted": "🟢 已采纳",
+        "closed": "⚫ 已关闭",
+    }
+    type_icon = {
+        "useful": "👍 有用",
+        "useless": "👎 无用",
+        "correction": "✏️ 纠正",
+    }
+
+    for fb in items:
+        badge = status_badge.get(fb.get("status", "pending"), "🟡 待处理")
+        icon = type_icon.get(fb.get("feedback_type", ""), "❓")
+        question = fb.get("question", "")[:60] or "（无问题记录）"
+        created = fb.get("created_at", "")[:19].replace("T", " ")
+
+        with st.expander(f"{icon} | {badge} | {question}… | {created}"):
+            st.markdown(f"**反馈类型**: {icon}")
+            st.markdown(f"**处理状态**: {badge}")
+            st.markdown(f"**提交时间**: {created}")
+
+            if fb.get("question"):
+                st.markdown(f"**原始问题**: {fb['question']}")
+            if fb.get("answer"):
+                st.markdown(f"**原始回答**: {fb['answer'][:300]}{'…' if len(fb.get('answer', '')) > 300 else ''}")
+
+            if fb.get("feedback_type") == "useless" and fb.get("reason"):
+                st.markdown(f"**无用原因**: {fb['reason']}")
+            if fb.get("feedback_type") == "correction" and fb.get("correction"):
+                st.markdown(f"**纠正内容**: {fb['correction']}")
+
+            if fb.get("admin_reply"):
+                st.info(f"💬 **管理员回复**: {fb['admin_reply']}")
+            if fb.get("reviewed_at"):
+                st.caption(f"处理时间: {fb['reviewed_at'][:19].replace('T', ' ')}")
+
+            # 普通用户可关闭待处理的反馈
+            if fb.get("status") == "pending":
+                st.button("关闭此反馈", key=f"close_fb_{fb['id']}",
+                          on_click=_close_feedback, args=(fb["id"],))
+
+
+def _close_feedback(feedback_id: int):
+    """关闭反馈回调。"""
+    api_put(f"/api/evaluation/feedback/{feedback_id}/status?status=closed")
+
+
+# ---------------------------------------------------------------------------
+# 管理员反馈管理页面
+# ---------------------------------------------------------------------------
+
+
+def _admin_review(feedback_id: int, status: str):
+    """管理员审核回调（在 expander 外层触发，避免 DOM 冲突）。"""
+    api_put(f"/api/evaluation/feedback/{feedback_id}/status?status={status}")
+
+
+def admin_feedback_page():
+    """管理员反馈管理面板。"""
+    st.title("📋 反馈管理")
+
+    tab_dash, tab_manage, tab_export = st.tabs(["📊 仪表盘", "📝 反馈管理", "📥 数据导出"])
+
+    # ---- 仪表盘 ----
+    with tab_dash:
+        stats = api_get("/api/evaluation/admin/stats")
+        if stats:
+            # 核心指标
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("总反馈数", stats.get("total", 0))
+            col2.metric("🟡 待处理", stats.get("pending_count", 0))
+            col3.metric("👍 有用", stats.get("useful", 0))
+            col4.metric("✏️ 纠正", stats.get("corrections", 0))
+
+            sat = stats.get("satisfaction_rate", 0)
+            st.progress(sat, text=f"满意度: {sat:.0%}")
+
+            st.divider()
+
+            # 7 天趋势
+            trend = stats.get("trend", [])
+            if trend:
+                st.subheader("📈 近 7 天趋势")
+                import pandas as pd
+                df = pd.DataFrame(trend)
+                df.columns = ["日期", "反馈数"]
+                st.line_chart(df.set_index("日期"))
+
+            # 类型分布
+            dist = stats.get("distribution", {})
+            if dist:
+                st.subheader("📊 类型分布")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("👍 有用", dist.get("useful", 0))
+                col2.metric("👎 无用", dist.get("useless", 0))
+                col3.metric("✏️ 纠正", dist.get("correction", 0))
+        else:
+            st.info("暂无统计数据")
+
+    # ---- 反馈管理 ----
+    with tab_manage:
+        # 筛选栏
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            fb_type = st.selectbox("类型", ["全部", "有用", "无用", "纠正"], key="admin_fb_type")
+        with col2:
+            fb_status = st.selectbox("状态", ["全部", "待处理", "已审阅", "已采纳", "忽略", "已关闭"], key="admin_fb_status")
+        with col3:
+            fb_kb = st.text_input("知识库 ID", key="admin_fb_kb", placeholder="留空=全部")
+        with col4:
+            fb_days = st.number_input("近 N 天", min_value=1, max_value=90, value=30, key="admin_fb_days")
+
+        type_map = {"全部": None, "有用": "useful", "无用": "useless", "纠正": "correction"}
+        status_map = {"全部": None, "待处理": "pending", "已审阅": "reviewed", "已采纳": "adopted", "忽略": "dismissed", "已关闭": "closed"}
+
+        params = {"limit": 50}
+        if type_map[fb_type]:
+            params["feedback_type"] = type_map[fb_type]
+        if status_map[fb_status]:
+            params["status"] = status_map[fb_status]
+        if fb_kb.strip():
+            params["kb_id"] = int(fb_kb.strip())
+        params["created_after"] = (datetime.utcnow() - timedelta(days=int(fb_days))).isoformat()
+
+        result = api_get("/api/evaluation/feedback", params=params)
+        items = result.get("items", []) if result else []
+        total = result.get("total", 0) if result else 0
+
+        st.caption(f"共 {total} 条反馈")
+
+        type_icon = {"useful": "👍", "useless": "👎", "correction": "✏️"}.get
+        status_badge = {
+            "pending": "🟡 待处理", "reviewed": "🔵 已审阅",
+            "adopted": "🟢 已采纳", "dismissed": "⚫ 已忽略", "closed": "⚫ 已关闭",
+        }.get
+
+        for fb in items:
+            icon = type_icon(fb.get("feedback_type", ""), "❓")
+            badge = status_badge(fb.get("status", "pending"), "🟡 待处理")
+            question = fb.get("question", "")[:50] or "（无问题记录）"
+            created = fb.get("created_at", "")[:19].replace("T", " ")
+
+            with st.expander(f"{icon} {badge} | {question}… | {created}"):
+                st.markdown(f"**用户 ID**: {fb.get('user_id', '-')} | **会话**: `{fb.get('session_id', '')[:12]}…`")
+                if fb.get("question"):
+                    st.markdown(f"**原始问题**: {fb['question']}")
+                if fb.get("answer"):
+                    st.markdown(f"**原始回答**: {fb['answer'][:500]}{'…' if len(fb.get('answer', '')) > 500 else ''}")
+                if fb.get("reason"):
+                    st.warning(f"**无用原因**: {fb['reason']}")
+                if fb.get("correction"):
+                    st.info(f"**纠正内容**: {fb['correction']}")
+                if fb.get("sources_json"):
+                    try:
+                        sources = json.loads(fb["sources_json"])
+                        if sources:
+                            st.markdown("**引用来源**:")
+                            for s in sources[:5]:
+                                st.caption(f"  - {s.get('filename', '?')} (chunk {s.get('chunk_id', '?')})")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if fb.get("admin_reply"):
+                    st.success(f"**审核备注**: {fb['admin_reply']}")
+
+                # 快速操作
+                st.divider()
+                col1, col2, col3, col4 = st.columns([1.5, 1.5, 1.5, 3])
+                with col1:
+                    st.button("🔵 已审核", key=f"review_{fb['id']}",
+                              on_click=_admin_review, args=(fb["id"], "reviewed"))
+                with col2:
+                    st.button("🟢 已采纳", key=f"adopt_{fb['id']}",
+                              on_click=_admin_review, args=(fb["id"], "adopted"))
+                with col3:
+                    st.button("⚫ 忽略", key=f"dismiss_{fb['id']}",
+                              on_click=_admin_review, args=(fb["id"], "dismissed"))
+                with col4:
+                    reply = st.text_input("审核备注", key=f"reply_{fb['id']}", placeholder="填写备注后点击左侧按钮…")
+
+    # ---- 数据导出 ----
+    with tab_export:
+        st.subheader("📥 导出反馈数据")
+        col1, col2 = st.columns(2)
+        with col1:
+            export_type = st.selectbox("反馈类型", ["全部", "有用", "无用", "纠正"], key="export_type")
+        with col2:
+            export_status = st.selectbox("处理状态", ["全部", "待处理", "已审阅", "已采纳", "忽略"], key="export_status")
+
+        export_params = {}
+        type_map2 = {"全部": None, "有用": "useful", "无用": "useless", "纠正": "correction"}
+        status_map2 = {"全部": None, "待处理": "pending", "已审阅": "reviewed", "已采纳": "adopted", "忽略": "dismissed"}
+        if type_map2[export_type]:
+            export_params["feedback_type"] = type_map2[export_type]
+        if status_map2[export_status]:
+            export_params["status"] = status_map2[export_status]
+
+        if st.button("📥 导出 CSV", key="export_csv"):
+            import io
+            params_str = "&".join(f"{k}={v}" for k, v in export_params.items())
+            url = f"/api/evaluation/admin/export?format=csv&{params_str}"
+            data = api_get(url)
+            if data:
+                st.download_button(
+                    "点击下载 CSV",
+                    data=str(data),
+                    file_name="feedback_export.csv",
+                    mime="text/csv",
+                )
+
+        if st.button("📥 导出 JSON", key="export_json"):
+            params_str = "&".join(f"{k}={v}" for k, v in export_params.items())
+            url = f"/api/evaluation/admin/export?format=json&{params_str}"
+            data = api_get(url)
+            if data:
+                st.download_button(
+                    "点击下载 JSON",
+                    data=json.dumps(data, ensure_ascii=False, indent=2),
+                    file_name="feedback_export.json",
+                    mime="application/json",
+                )
+
+
+# ---------------------------------------------------------------------------
+# 评估页面
+# ---------------------------------------------------------------------------
+
+
+def evaluation_page():
+    """评估与反馈查看页面。"""
+    st.title("📊 评估与反馈")
+
+    tab1, tab2, tab3 = st.tabs(["📈 综合统计", "💬 反馈记录", "📋 查询日志"])
+
+    # ---- 综合统计 ----
+    with tab1:
+        stats = api_get("/api/evaluation/stats")
+        if stats:
+            fb = stats.get("feedback", {})
+            ql = stats.get("query_log", {})
+
+            st.subheader("📊 反馈统计")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("总反馈数", fb.get("total", 0))
+            col2.metric("👍 有用", fb.get("useful", 0))
+            col3.metric("👎 无用", fb.get("useless", 0))
+            col4.metric("✏️ 纠正", fb.get("corrections", 0))
+
+            # 满意度进度条
+            sat = fb.get("satisfaction_rate", 0)
+            st.progress(sat, text=f"满意度: {sat:.0%}")
+
+            st.divider()
+            st.subheader("📋 查询日志统计")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("总查询数", ql.get("total", 0))
+            col2.metric("平均延迟", f"{ql.get('avg_latency_ms', 0):.0f} ms")
+            col3.metric("平均 Token", f"{ql.get('avg_tokens', 0):.0f}")
+            col4.metric("平均召回数", f"{ql.get('avg_retrieval_count', 0):.0f}")
+        else:
+            st.info("📭 暂无统计数据。使用问答功能并提交反馈后，统计数据将在此显示。")
+
+    # ---- 反馈记录 ----
+    with tab2:
+        limit = st.slider("显示条数", 10, 200, 50, key="fb_limit")
+        result = api_get("/api/evaluation/feedback", params={"limit": limit})
+        feedbacks = result.get("items", []) if result else []
+        if feedbacks:
+            type_icon = {"useful": "👍", "useless": "👎", "correction": "✏️"}.get
+            status_badge = {"pending": "🟡待处理", "reviewed": "🔵已审阅", "adopted": "🟢已采纳", "closed": "⚫已关闭"}.get
+            for fb in feedbacks:
+                icon = type_icon(fb.get("feedback_type", ""), "❓")
+                badge = status_badge(fb.get("status", "pending"), "🟡待处理")
+                with st.expander(f"{icon} {fb.get('feedback_type', '')} | {badge}"):
+                    st.write(f"**用户 ID**: {fb.get('user_id', '-')}")
+                    if fb.get("question"):
+                        st.write(f"**问题**: {fb['question'][:200]}")
+                    if fb.get("reason"):
+                        st.write(f"**原因**: {fb['reason']}")
+                    if fb.get("correction"):
+                        st.write(f"**纠正**: {fb['correction']}")
+                    if fb.get("admin_reply"):
+                        st.info(f"**管理员回复**: {fb['admin_reply']}")
+                    st.caption(fb.get("created_at", ""))
+        else:
+            st.info("暂无反馈记录")
+
+    # ---- 查询日志 ----
+    with tab3:
+        limit = st.slider("显示条数", 10, 200, 50, key="log_limit")
+        logs = api_get("/api/evaluation/logs", params={"limit": limit})
+        if logs:
+            for log in logs:
+                latency = log.get("latency_ms", 0)
+                color = "🟢" if latency < 2000 else ("🟡" if latency < 5000 else "🔴")
+                with st.expander(f"{color} {log.get('question', '')[:50]}…"):
+                    st.write(f"**问题**: {log.get('question', '')}")
+                    if log.get("rewritten_query"):
+                        st.write(f"**改写后**: {log['rewritten_query']}")
+                    st.write(f"**回答**: {log.get('answer', '')[:200]}…")
+                    col1, col2, col3 = st.columns(3)
+                    col1.caption(f"延迟: {latency} ms")
+                    col2.caption(f"Token: {log.get('token_total', 0)}")
+                    col3.caption(f"召回: {log.get('retrieval_count', 0)} / 重排: {log.get('reranked_count', 0)}")
+                    st.caption(f"模型: {log.get('model', '-')} | 策略: {log.get('retrieval_strategy', '-')}")
+                    st.caption(log.get("created_at", ""))
+        else:
+            st.info("暂无查询日志")
+
+
+# ---------------------------------------------------------------------------
+# 向量库监控页面（管理员）
+# ---------------------------------------------------------------------------
+
+
+def vector_monitor_page():
+    """管理员向量库监控面板。"""
+    st.title("🔍 向量库监控")
+
+    # --- 概览 ---
+    stats = api_get("/api/admin/vectors/stats")
+    if not stats:
+        st.error("获取向量库信息失败")
+        return
+
+    col1, col2 = st.columns(2)
+    col1.metric("Collections", stats["total_collections"])
+    col2.metric("总 Chunks", stats["total_chunks"])
+
+    collections = stats.get("collections", [])
+    if not collections:
+        st.info("向量库中暂无数据")
+        return
+
+    st.markdown("---")
+
+    # --- Collection 选择 ---
+    options = [
+        f"{c['collection']}  |  {c.get('kb_name') or '-'}  |  {c['chunk_count']} chunks"
+        for c in collections
+    ]
+    kb_ids = [c["kb_id"] for c in collections]
+
+    selected = st.selectbox("选择知识库 Collection", options, key="vec_coll_select")
+    idx = options.index(selected)
+    kb_id = kb_ids[idx]
+
+    if kb_id is None:
+        st.warning("该 Collection 无关联知识库")
+        return
+
+    # --- 搜索 & 筛选 ---
+    col_search, col_filter = st.columns([2, 1])
+    with col_search:
+        query = st.text_input("🔎 关键词搜索", key="vec_search_q", placeholder="输入文本关键词…")
+    with col_filter:
+        filename_filter = st.text_input("文件名筛选", key="vec_file_filter", placeholder="可选")
+
+    # --- 分页 ---
+    page_size = 20
+    if "vec_page" not in st.session_state:
+        st.session_state["vec_page"] = 1
+
+    page = st.session_state["vec_page"]
+
+    if query:
+        result = api_get(
+            f"/api/admin/vectors/{kb_id}/search",
+            params={"q": query, "filename": filename_filter or None, "page": page, "page_size": page_size},
+        )
+    else:
+        result = api_get(
+            f"/api/admin/vectors/{kb_id}/chunks",
+            params={"page": page, "page_size": page_size, "filename": filename_filter or None},
+        )
+
+    if not result:
+        st.error("查询失败")
+        return
+
+    total = result["total"]
+    items = result.get("items", [])
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    st.caption(f"共 {total} 条  |  第 {page}/{total_pages} 页")
+
+    # --- 分页按钮 ---
+    nav1, nav2, nav3, nav4 = st.columns(4)
+    with nav1:
+        if st.button("⏮ 首页", key="vec_first", disabled=(page <= 1), use_container_width=True):
+            st.session_state["vec_page"] = 1
+            st.rerun()
+    with nav2:
+        if st.button("◀ 上一页", key="vec_prev", disabled=(page <= 1), use_container_width=True):
+            st.session_state["vec_page"] = page - 1
+            st.rerun()
+    with nav3:
+        if st.button("下一页 ▶", key="vec_next", disabled=(page >= total_pages), use_container_width=True):
+            st.session_state["vec_page"] = page + 1
+            st.rerun()
+    with nav4:
+        if st.button("末页 ⏭", key="vec_last", disabled=(page >= total_pages), use_container_width=True):
+            st.session_state["vec_page"] = total_pages
+            st.rerun()
+
+    st.markdown("---")
+
+    # --- Chunk 列表 ---
+    if not items:
+        st.info("本页无数据")
+        return
+
+    for item in items:
+        chunk_id = item["chunk_id"]
+        preview = item["text_preview"]
+        meta = item.get("metadata", {})
+        fname = item.get("filename", meta.get("filename", "-"))
+        level = item.get("chunk_level", meta.get("chunk_level", "-"))
+        modality = item.get("modality", meta.get("modality", "text"))
+        created = item.get("created_at", meta.get("created_at", "-"))
+
+        icon = "📝" if modality == "text" else "🖼️"
+        level_tag = f" [{level}]" if level else ""
+
+        with st.expander(f"{icon} `{chunk_id}`{level_tag} — {fname}"):
+            st.text_area(
+                "文本内容", preview, height=120, disabled=True,
+                key=f"vec_txt_{chunk_id}",
+            )
+            col_a, col_b, col_c = st.columns(3)
+            col_a.caption(f"文件: {fname}")
+            col_b.caption(f"层级: {level or '-'}")
+            col_c.caption(f"创建: {created[:19] if created and len(created) > 19 else created}")
+
+            # 查看完整详情
+            if st.button("📋 查看完整详情", key=f"vec_detail_{chunk_id}"):
+                detail = api_get(f"/api/admin/vectors/{kb_id}/chunks/{chunk_id}")
+                if detail:
+                    st.json(detail)
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+
+def main():
+    st.set_page_config(
+        page_title="RAG 智能问答",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # 未登录 → 显示登录/注册页面
+    if not st.session_state.get("access_token"):
+        auth_page()
+        return
+
+    # 已登录 → 主界面
+    sidebar_user()
+
+    current_page = st.session_state.get("current_page", "chat")
+    if current_page == "evaluation":
+        evaluation_page()
+    elif current_page == "admin_feedback":
+        admin_feedback_page()
+    elif current_page == "my_feedback":
+        my_feedback_page()
+    elif current_page == "vector_monitor":
+        vector_monitor_page()
+    else:
+        sidebar_knowledge_base()
+        sidebar_documents()
+        sidebar_sessions()
+        main_chat()
+
+
+if __name__ == "__main__":
+    main()

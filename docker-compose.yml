@@ -9,5 +9,6 @@ services:
       - ./config:/app/config
     environment:
       - SECRET_KEY=${SECRET_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - MIMO_API_KEY=${MIMO_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
     restart: unless-stopped
